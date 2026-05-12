@@ -277,6 +277,59 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         )
 
 
+# 新增单臂piper-lerobot数据格式 映射配置文件
+@dataclasses.dataclass(frozen=True)
+class LeRobotPhysVLADataConfig(DataConfigFactory):
+    # Piper single-arm data: 6 arm joints + 1 gripper.
+    # If true, arm joint targets are converted to deltas while the gripper stays absolute.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "base_0_rgb": "observation.images.rgb_main",
+                            "left_wrist_0_rgb": "observation.images.rgb_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[aloha_policy.AlohaInputs(adapt_to_pi=False)],
+            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=False)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotAlohaPoseDataConfig(DataConfigFactory):
     # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
@@ -1380,6 +1433,37 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    #
+    # PhysVLA / 新增piper单臂 开关笔记本 训练配置
+    #
+    TrainConfig(
+        name="pi05_physvla_open_laptop_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotPhysVLADataConfig(
+            repo_id="/home/ubuntu/workspace/physvla_sim/lerobot_datasets/open_laptop_lid",
+            # Norm stats from compute_norm_stats.py are written next to the LeRobot dataset (…/open_laptop_lid/norm_stats.json).
+            # Point assets here so training loads the same file; asset_id must match that directory name.
+            assets=AssetsConfig(
+                assets_dir="/home/ubuntu/workspace/physvla_sim/lerobot_datasets",
+                asset_id="open_laptop_lid",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            default_prompt="open_laptop_lid",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        batch_size=4,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
